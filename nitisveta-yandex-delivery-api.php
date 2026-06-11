@@ -220,13 +220,12 @@ final class Nitisveta_Yandex_Delivery_Api
             return;
         }
 
-        $point_id = isset($_POST['yandex_delivery_pickup_point_id'])
-            ? sanitize_text_field(wp_unslash($_POST['yandex_delivery_pickup_point_id']))
-            : '';
-
-        if ($point_id === '') {
-            $errors->add('yandex_delivery_pickup_point_required', 'Выберите пункт выдачи Яндекс Доставки.');
+        $selected_point = self::get_selected_pickup_point();
+        if (!empty($selected_point['id'])) {
+            return;
         }
+
+        $errors->add('yandex_delivery_pickup_point_required', 'Выберите пункт выдачи Яндекс Доставки.');
     }
 
     public static function save_order_meta(WC_Order $order, array $data): void
@@ -243,12 +242,20 @@ final class Nitisveta_Yandex_Delivery_Api
             'pickup_point_lon' => 'yandex_delivery_pickup_point_lon',
         ];
 
-        foreach ($fields as $meta_key => $post_key) {
-            if (!isset($_POST[$post_key])) {
-                continue;
-            }
+        $selected_point = self::get_selected_pickup_point();
+        $fallback_values = [
+            'pickup_point_id' => $selected_point['id'] ?? '',
+            'pickup_point_name' => $selected_point['name'] ?? '',
+            'pickup_point_address' => $selected_point['address'] ?? '',
+            'pickup_point_lat' => $selected_point['lat'] ?? '',
+            'pickup_point_lon' => $selected_point['lon'] ?? '',
+        ];
 
-            $value = sanitize_text_field(wp_unslash($_POST[$post_key]));
+        foreach ($fields as $meta_key => $post_key) {
+            $value = isset($_POST[$post_key])
+                ? sanitize_text_field(wp_unslash($_POST[$post_key]))
+                : sanitize_text_field((string) ($fallback_values[$meta_key] ?? ''));
+
             if ($value !== '') {
                 $order->update_meta_data(self::META_PREFIX . $meta_key, $value);
             }
