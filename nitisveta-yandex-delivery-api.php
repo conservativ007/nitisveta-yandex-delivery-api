@@ -26,6 +26,7 @@ final class Nitisveta_Yandex_Delivery_Api
         add_action('wp_enqueue_scripts', [__CLASS__, 'enqueue_checkout_assets'], 30);
         add_action('rest_api_init', [__CLASS__, 'register_rest_routes']);
         add_filter('woocommerce_package_rates', [__CLASS__, 'add_pickup_shipping_rate'], 20, 2);
+        add_filter('woocommerce_package_rates', [__CLASS__, 'hide_shipping_rates_until_city_selected'], 9999, 2);
         add_filter('woocommerce_cart_shipping_method_full_label', [__CLASS__, 'format_pickup_shipping_label'], 20, 2);
         add_action('woocommerce_checkout_after_customer_details', [__CLASS__, 'render_pickup_mount']);
         add_action('woocommerce_after_checkout_validation', [__CLASS__, 'validate_checkout'], 10, 2);
@@ -187,6 +188,21 @@ final class Nitisveta_Yandex_Delivery_Api
         );
 
         return $rates;
+    }
+
+    public static function hide_shipping_rates_until_city_selected(array $rates, array $package): array
+    {
+        if (!self::is_checkout_rate_request()) {
+            return $rates;
+        }
+
+        if (self::is_checkout_city_selected($package)) {
+            return $rates;
+        }
+
+        self::log('Shipping rates hidden: checkout city is not selected.');
+
+        return [];
     }
 
     public static function format_pickup_shipping_label(string $label, WC_Shipping_Rate $method): string
@@ -582,6 +598,10 @@ final class Nitisveta_Yandex_Delivery_Api
             return false;
         }
 
+        if (self::is_checkout_rate_request() && !self::is_checkout_city_selected($package)) {
+            return false;
+        }
+
         foreach ($rates as $rate) {
             if (!is_object($rate) || !method_exists($rate, 'get_id')) {
                 continue;
@@ -596,6 +616,60 @@ final class Nitisveta_Yandex_Delivery_Api
         return $country === '' || strtoupper((string) $country) === 'RU';
     }
 
+    private static function is_checkout_rate_request(): bool
+    {
+        if (function_exists('is_checkout') && is_checkout()) {
+            return true;
+        }
+
+        $wc_ajax = isset($_GET['wc-ajax']) ? sanitize_key(wp_unslash($_GET['wc-ajax'])) : '';
+        if ($wc_ajax === 'update_order_review') {
+            return true;
+        }
+
+        return isset($_POST['post_data']);
+    }
+
+    private static function is_checkout_city_selected(array $package = []): bool
+    {
+        $city = self::get_checkout_city_value($package);
+
+        return $city !== '' && self::lower($city) !== 'город';
+    }
+
+    private static function get_checkout_city_value(array $package = []): string
+    {
+        $candidates = [];
+
+        if (isset($_POST['billing_city'])) {
+            $candidates[] = sanitize_text_field(wp_unslash($_POST['billing_city']));
+        }
+
+        if (isset($_POST['post_data'])) {
+            parse_str((string) wp_unslash($_POST['post_data']), $post_data);
+            if (isset($post_data['billing_city'])) {
+                $candidates[] = sanitize_text_field((string) $post_data['billing_city']);
+            }
+        }
+
+        if (!empty($package['destination']['city'])) {
+            $candidates[] = sanitize_text_field((string) $package['destination']['city']);
+        }
+
+        if (function_exists('WC') && WC()->customer) {
+            $candidates[] = sanitize_text_field((string) WC()->customer->get_billing_city());
+            $candidates[] = sanitize_text_field((string) WC()->customer->get_shipping_city());
+        }
+
+        foreach ($candidates as $candidate) {
+            $candidate = trim((string) $candidate);
+            if ($candidate !== '' && self::lower($candidate) !== 'город') {
+                return $candidate;
+            }
+        }
+
+        return '';
+    }
     private static function get_pickup_rate_cost(array $package = []): float
     {
         $calculated = self::calculate_pickup_rate_cost($package);
@@ -1118,11 +1192,35 @@ final class Nitisveta_Yandex_Delivery_Api
 
     private static function get_map_api_key(): string
     {
+        $key = '';
+
         if (defined('YANDEX_MAPS_API_KEY')) {
-            return (string) YANDEX_MAPS_API_KEY;
+            $key = (string) YANDEX_MAPS_API_KEY;
+        } else {
+            $key = (string) get_option('nitisveta_yandex_maps_api_key', '');
         }
 
-        return (string) get_option('nitisveta_yandex_maps_api_key', '');
+        $key = trim($key);
+        if ($key === '' || self::looks_like_invalid_maps_api_key($key)) {
+            return '';
+        }
+
+        return $key;
+    }
+
+    private static function looks_like_invalid_maps_api_key(string $key): bool
+    {
+        $lower = self::lower($key);
+
+        if (strpos($lower, 'ключ') !== false || strpos($lower, 'token') !== false) {
+            return true;
+        }
+
+        if (strpos($key, 'y0__') === 0) {
+            return true;
+        }
+
+        return false;
     }
 
     private static function plugin_dir(): string
@@ -1132,7 +1230,7 @@ final class Nitisveta_Yandex_Delivery_Api
 
     private static function plugin_url(): string
     {
-        return content_url('mu-plugins/yandex-delivery-api/');
+        return content_url('mu-plugins/nitisveta-yandex-delivery-api/');
     }
 
     private static function asset_version(string $path): string
