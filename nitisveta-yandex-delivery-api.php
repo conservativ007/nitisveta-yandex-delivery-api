@@ -31,6 +31,7 @@ final class Nitisveta_Yandex_Delivery_Api
         add_action('woocommerce_checkout_after_customer_details', [__CLASS__, 'render_pickup_mount']);
         add_action('woocommerce_after_checkout_validation', [__CLASS__, 'validate_checkout'], 10, 2);
         add_action('woocommerce_checkout_create_order', [__CLASS__, 'save_order_meta'], 10, 2);
+        add_action('woocommerce_checkout_order_created', [__CLASS__, 'ensure_order_pickup_meta'], 10, 1);
         add_action('woocommerce_admin_order_data_after_shipping_address', [__CLASS__, 'render_admin_order_meta']);
         add_action('woocommerce_email_after_order_table', [__CLASS__, 'render_email_order_meta'], 20, 4);
     }
@@ -127,8 +128,25 @@ final class Nitisveta_Yandex_Delivery_Api
 
         if (!$points) {
             $remote = self::load_remote_pickup_points($city, $country, $bounds);
-            $points = is_wp_error($remote) ? [] : $remote;
+
+            if (is_wp_error($remote)) {
+                self::log('Pickup points request failed.', [
+                    'city' => $city,
+                    'country' => $country,
+                    'error_code' => $remote->get_error_code(),
+                    'error_message' => $remote->get_error_message(),
+                ]);
+                $points = [];
+            } else {
+                $points = $remote;
+            }
         }
+
+        self::log('Pickup points response prepared.', [
+            'city' => $city,
+            'country' => $country,
+            'count' => count($points),
+        ]);
 
         return rest_ensure_response([
             'points' => array_values($points),
@@ -230,32 +248,56 @@ final class Nitisveta_Yandex_Delivery_Api
 
     public static function save_order_meta(WC_Order $order, array $data): void
     {
-        if (!self::is_yandex_shipping_selected()) {
+        if (!self::is_yandex_shipping_selected() && !self::order_uses_yandex_shipping($order)) {
+            return;
+        }
+
+        self::store_pickup_point_meta($order, self::get_selected_pickup_point());
+    }
+
+    public static function ensure_order_pickup_meta(WC_Order $order): void
+    {
+        if (!self::order_uses_yandex_shipping($order)) {
+            return;
+        }
+
+        if ($order->get_meta(self::META_PREFIX . 'pickup_point_id')) {
+            return;
+        }
+
+        $point = self::get_selected_pickup_point();
+        if (empty($point['id'])) {
+            self::log('Order pickup point was not saved: selected point is unavailable.', [
+                'order_id' => $order->get_id(),
+            ]);
+            return;
+        }
+
+        self::store_pickup_point_meta($order, $point);
+        $order->save();
+
+        self::log('Order pickup point saved after order creation.', [
+            'order_id' => $order->get_id(),
+            'pickup_point_id' => $point['id'],
+        ]);
+    }
+
+    private static function store_pickup_point_meta(WC_Order $order, array $selected_point): void
+    {
+        if (empty($selected_point['id'])) {
             return;
         }
 
         $fields = [
-            'pickup_point_id' => 'yandex_delivery_pickup_point_id',
-            'pickup_point_name' => 'yandex_delivery_pickup_point_name',
-            'pickup_point_address' => 'yandex_delivery_pickup_point_address',
-            'pickup_point_lat' => 'yandex_delivery_pickup_point_lat',
-            'pickup_point_lon' => 'yandex_delivery_pickup_point_lon',
+            'pickup_point_id' => 'id',
+            'pickup_point_name' => 'name',
+            'pickup_point_address' => 'address',
+            'pickup_point_lat' => 'lat',
+            'pickup_point_lon' => 'lon',
         ];
 
-        $selected_point = self::get_selected_pickup_point();
-        $fallback_values = [
-            'pickup_point_id' => $selected_point['id'] ?? '',
-            'pickup_point_name' => $selected_point['name'] ?? '',
-            'pickup_point_address' => $selected_point['address'] ?? '',
-            'pickup_point_lat' => $selected_point['lat'] ?? '',
-            'pickup_point_lon' => $selected_point['lon'] ?? '',
-        ];
-
-        foreach ($fields as $meta_key => $post_key) {
-            $value = isset($_POST[$post_key])
-                ? sanitize_text_field(wp_unslash($_POST[$post_key]))
-                : sanitize_text_field((string) ($fallback_values[$meta_key] ?? ''));
-
+        foreach ($fields as $meta_key => $point_key) {
+            $value = sanitize_text_field((string) ($selected_point[$point_key] ?? ''));
             if ($value !== '') {
                 $order->update_meta_data(self::META_PREFIX . $meta_key, $value);
             }
@@ -315,6 +357,13 @@ final class Nitisveta_Yandex_Delivery_Api
         $url = self::get_pickup_points_url();
         $token = self::get_api_token();
 
+        self::log('Pickup points request started.', [
+            'city' => $city,
+            'country' => $country,
+            'uses_custom_url' => (bool) $url,
+            'has_token' => $token !== '',
+        ]);
+
         if ($url) {
             $response = wp_remote_get(add_query_arg(array_filter([
                 'city' => $city,
@@ -337,20 +386,35 @@ final class Nitisveta_Yandex_Delivery_Api
         }
 
         if (is_wp_error($response)) {
+            self::log('Pickup points HTTP request failed.', [
+                'error_code' => $response->get_error_code(),
+                'error_message' => $response->get_error_message(),
+            ]);
             return $response;
         }
 
         $code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+        self::log('Pickup points API response received.', [
+            'http_code' => $code,
+            'body' => self::truncate_log_value($response_body),
+        ]);
+
         if ($code < 200 || $code >= 300) {
             return new WP_Error('yandex_delivery_bad_response', 'Yandex Delivery pickup points API returned HTTP ' . $code);
         }
 
-        $decoded = json_decode(wp_remote_retrieve_body($response), true);
+        $decoded = json_decode($response_body, true);
         if (!is_array($decoded)) {
             return new WP_Error('yandex_delivery_bad_json', 'Yandex Delivery pickup points API returned invalid JSON.');
         }
 
-        return self::filter_points(self::normalize_pickup_points($decoded), $city, $country);
+        $points = self::filter_points(self::normalize_pickup_points($decoded), $city, $country);
+        self::log('Pickup points normalized.', [
+            'count' => count($points),
+        ]);
+
+        return $points;
     }
 
     private static function build_yandex_pickup_points_body(string $city): array
@@ -387,11 +451,23 @@ final class Nitisveta_Yandex_Delivery_Api
         ]);
 
         if (is_wp_error($response)) {
+            self::log('Location detect request failed.', [
+                'city' => $city,
+                'error_code' => $response->get_error_code(),
+                'error_message' => $response->get_error_message(),
+            ]);
             return null;
         }
 
-        $decoded = json_decode(wp_remote_retrieve_body($response), true);
-        if (!is_array($decoded) || empty($decoded['variants'][0]['geo_id'])) {
+        $code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+        $decoded = json_decode($response_body, true);
+        if ($code < 200 || $code >= 300 || !is_array($decoded) || empty($decoded['variants'][0]['geo_id'])) {
+            self::log('Location detect did not return geo_id.', [
+                'city' => $city,
+                'http_code' => $code,
+                'body' => self::truncate_log_value($response_body),
+            ]);
             return null;
         }
 
@@ -597,6 +673,17 @@ final class Nitisveta_Yandex_Delivery_Api
     private static function is_yandex_shipping_method(string $method_id): bool
     {
         return in_array($method_id, [self::SHIPPING_METHOD_ID, self::PICKUP_RATE_ID], true);
+    }
+
+    private static function order_uses_yandex_shipping(WC_Order $order): bool
+    {
+        foreach ($order->get_shipping_methods() as $shipping_method) {
+            if (self::is_yandex_shipping_method((string) $shipping_method->get_method_id())) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static function should_add_pickup_rate(array $rates, array $package): bool

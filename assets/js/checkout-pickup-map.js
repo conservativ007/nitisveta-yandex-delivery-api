@@ -465,8 +465,8 @@
 	function validateBeforeSubmit(event) {
 		if (!isYandexSelected()) return;
 
-		const pointId = document.getElementById('yandex_delivery_pickup_point_id')?.value || '';
-		if (pointId) return;
+		const selectedPoint = state.selectedPoint || readSelectedPointFromFields();
+		if (selectedPoint?.id) return;
 
 		event.preventDefault();
 		event.stopImmediatePropagation();
