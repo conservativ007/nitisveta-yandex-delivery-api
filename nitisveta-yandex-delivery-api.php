@@ -229,6 +229,10 @@ final class Nitisveta_Yandex_Delivery_Api
             return $label;
         }
 
+        if (empty(self::get_selected_pickup_point()['id'])) {
+            return 'Яндекс Доставка до ПВЗ';
+        }
+
         return 'Яндекс Доставка до ПВЗ: ' . wc_price((float) $method->get_cost());
     }
 
@@ -409,7 +413,7 @@ final class Nitisveta_Yandex_Delivery_Api
             return new WP_Error('yandex_delivery_bad_json', 'Yandex Delivery pickup points API returned invalid JSON.');
         }
 
-        $points = self::filter_points(self::normalize_pickup_points($decoded), $city, $country);
+        $points = self::filter_points(self::normalize_pickup_points($decoded, 120), $city, $country);
         self::log('Pickup points normalized.', [
             'count' => count($points),
         ]);
@@ -496,7 +500,7 @@ final class Nitisveta_Yandex_Delivery_Api
         ]);
     }
 
-    private static function normalize_pickup_points(array $payload): array
+    private static function normalize_pickup_points(array $payload, int $limit = 0): array
     {
         $items = self::extract_pickup_items($payload);
 
@@ -551,6 +555,10 @@ final class Nitisveta_Yandex_Delivery_Api
                 'operator_id' => (string) ($item['operator_id'] ?? ''),
                 'available_for_dropoff' => isset($item['available_for_dropoff']) ? (bool) $item['available_for_dropoff'] : null,
             ];
+
+            if ($limit > 0 && count($points) >= $limit) {
+                break;
+            }
         }
 
         return $points;
