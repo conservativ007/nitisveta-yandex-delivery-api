@@ -34,6 +34,7 @@ final class Nitisveta_Yandex_Delivery_Api
         add_action('woocommerce_checkout_order_created', [__CLASS__, 'ensure_order_pickup_meta'], 10, 1);
         add_action('woocommerce_admin_order_data_after_shipping_address', [__CLASS__, 'render_admin_order_meta']);
         add_action('woocommerce_email_after_order_table', [__CLASS__, 'render_email_order_meta'], 20, 4);
+        add_filter('gettext', [__CLASS__, 'rename_admin_billing_heading'], 10, 3);
     }
 
     public static function enqueue_checkout_assets(): void
@@ -100,6 +101,10 @@ final class Nitisveta_Yandex_Delivery_Api
                     'sanitize_callback' => 'sanitize_text_field',
                     'default' => '',
                 ],
+                'query' => [
+                    'sanitize_callback' => 'sanitize_text_field',
+                    'default' => '',
+                ],
             ],
         ]);
 
@@ -115,6 +120,7 @@ final class Nitisveta_Yandex_Delivery_Api
         $city = trim((string) $request->get_param('city'));
         $country = trim((string) $request->get_param('country'));
         $bounds = trim((string) $request->get_param('bounds'));
+        $query = trim((string) $request->get_param('query'));
 
         if ($city === '' || self::lower($city) === 'город') {
             return rest_ensure_response([
@@ -125,9 +131,14 @@ final class Nitisveta_Yandex_Delivery_Api
         }
 
         $points = self::load_local_pickup_points($city, $country);
+        if ($query !== '') {
+            $points = array_slice(array_values(array_filter($points, static function (array $point) use ($query): bool {
+                return self::pickup_point_matches_query($point, $query);
+            })), 0, 30);
+        }
 
         if (!$points) {
-            $remote = self::load_remote_pickup_points($city, $country, $bounds);
+            $remote = self::load_remote_pickup_points($city, $country, $bounds, $query);
 
             if (is_wp_error($remote)) {
                 self::log('Pickup points request failed.', [
@@ -199,7 +210,7 @@ final class Nitisveta_Yandex_Delivery_Api
 
         $rates[self::PICKUP_RATE_ID] = new WC_Shipping_Rate(
             self::PICKUP_RATE_ID,
-            'Яндекс Доставка до ПВЗ',
+            'Яндекс до пункта выдачи заказов',
             self::get_pickup_rate_cost($package),
             [],
             self::PICKUP_RATE_ID
@@ -230,24 +241,27 @@ final class Nitisveta_Yandex_Delivery_Api
         }
 
         if (empty(self::get_selected_pickup_point()['id'])) {
-            return 'Яндекс Доставка до ПВЗ';
+            return 'Яндекс до пункта выдачи заказов';
         }
 
-        return 'Яндекс Доставка до ПВЗ: ' . wc_price((float) $method->get_cost());
+        return 'Яндекс до пункта выдачи заказов: ' . wc_price((float) $method->get_cost());
     }
 
     public static function validate_checkout(array $data, WP_Error $errors): void
     {
-        if (!self::is_yandex_shipping_selected()) {
+        if (!self::is_yandex_shipping_selected($data)) {
             return;
         }
 
         $selected_point = self::get_selected_pickup_point();
-        if (!empty($selected_point['id'])) {
+        if (empty($selected_point['id'])) {
+            $errors->add('yandex_delivery_pickup_point_required', 'Выберите пункт выдачи Яндекс Доставки.');
             return;
         }
 
-        $errors->add('yandex_delivery_pickup_point_required', 'Выберите пункт выдачи Яндекс Доставки.');
+        if (!function_exists('WC') || !WC()->cart || (float) WC()->cart->get_shipping_total() <= 0) {
+            $errors->add('yandex_delivery_price_required', 'Не удалось рассчитать стоимость Яндекс Доставки. Выберите пункт выдачи ещё раз.');
+        }
     }
 
     public static function save_order_meta(WC_Order $order, array $data): void
@@ -306,6 +320,12 @@ final class Nitisveta_Yandex_Delivery_Api
                 $order->update_meta_data(self::META_PREFIX . $meta_key, $value);
             }
         }
+
+        $pickup_address = sanitize_text_field((string) ($selected_point['address'] ?? ''));
+        if ($pickup_address !== '') {
+            $order->set_shipping_address_1($pickup_address);
+            $order->set_shipping_address_2('');
+        }
     }
 
     public static function render_admin_order_meta(WC_Order $order): void
@@ -320,6 +340,21 @@ final class Nitisveta_Yandex_Delivery_Api
         echo esc_html($point['name'] ?: $point['id']) . '<br>';
         echo esc_html($point['address']);
         echo '</p></div>';
+    }
+
+    public static function rename_admin_billing_heading(string $translation, string $text, string $domain): string
+    {
+        if (
+            is_admin()
+            && $domain === 'woocommerce'
+            && $text === 'Billing'
+            && sanitize_key((string) ($_GET['page'] ?? '')) === 'wc-orders'
+            && sanitize_key((string) ($_GET['action'] ?? '')) === 'edit'
+        ) {
+            return 'Адрес покупателя (не адрес доставки)';
+        }
+
+        return $translation;
     }
 
     public static function render_email_order_meta(WC_Order $order, bool $sent_to_admin, bool $plain_text, WC_Email $email): void
@@ -356,7 +391,7 @@ final class Nitisveta_Yandex_Delivery_Api
         return self::filter_points($points, $city, $country);
     }
 
-    private static function load_remote_pickup_points(string $city, string $country, string $bounds)
+    private static function load_remote_pickup_points(string $city, string $country, string $bounds, string $query = '')
     {
         $url = self::get_pickup_points_url();
         $token = self::get_api_token();
@@ -373,6 +408,7 @@ final class Nitisveta_Yandex_Delivery_Api
                 'city' => $city,
                 'country' => $country,
                 'bounds' => $bounds,
+                'query' => $query,
             ]), $url), [
                 'timeout' => 15,
                 'headers' => array_filter([
@@ -413,7 +449,7 @@ final class Nitisveta_Yandex_Delivery_Api
             return new WP_Error('yandex_delivery_bad_json', 'Yandex Delivery pickup points API returned invalid JSON.');
         }
 
-        $points = self::filter_points(self::normalize_pickup_points($decoded, 120), $city, $country);
+        $points = self::filter_points(self::normalize_pickup_points($decoded, $query === '' ? 100 : 30, $query), $city, $country);
         self::log('Pickup points normalized.', [
             'count' => count($points),
         ]);
@@ -500,7 +536,7 @@ final class Nitisveta_Yandex_Delivery_Api
         ]);
     }
 
-    private static function normalize_pickup_points(array $payload, int $limit = 0): array
+    private static function normalize_pickup_points(array $payload, int $limit = 0, string $query = ''): array
     {
         $items = self::extract_pickup_items($payload);
 
@@ -543,7 +579,7 @@ final class Nitisveta_Yandex_Delivery_Api
                 continue;
             }
 
-            $points[] = [
+            $point = [
                 'id' => (string) $id,
                 'name' => (string) ($item['name'] ?? $item['title'] ?? 'Пункт выдачи Яндекс'),
                 'address' => (string) $address,
@@ -556,12 +592,30 @@ final class Nitisveta_Yandex_Delivery_Api
                 'available_for_dropoff' => isset($item['available_for_dropoff']) ? (bool) $item['available_for_dropoff'] : null,
             ];
 
+            if ($query !== '' && !self::pickup_point_matches_query($point, $query)) {
+                continue;
+            }
+
+            $points[] = $point;
+
             if ($limit > 0 && count($points) >= $limit) {
                 break;
             }
         }
 
         return $points;
+    }
+
+    private static function pickup_point_matches_query(array $point, string $query): bool
+    {
+        $haystack = self::normalize_address_for_match(($point['name'] ?? '') . ' ' . ($point['address'] ?? ''));
+        foreach (array_filter(explode(' ', self::normalize_address_for_match($query))) as $token) {
+            if (strpos($haystack, $token) === false) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static function format_schedule($schedule): string
@@ -665,9 +719,22 @@ final class Nitisveta_Yandex_Delivery_Api
         return strtoupper($point_country) === $checkout_country;
     }
 
-    private static function is_yandex_shipping_selected(): bool
+    private static function is_yandex_shipping_selected(array $data = []): bool
     {
-        $methods = isset($_POST['shipping_method']) ? (array) wp_unslash($_POST['shipping_method']) : [];
+        $methods = isset($data['shipping_method']) ? (array) $data['shipping_method'] : [];
+
+        if (!$methods && isset($_POST['shipping_method'])) {
+            $methods = (array) wp_unslash($_POST['shipping_method']);
+        }
+
+        if (!$methods && isset($_POST['post_data'])) {
+            parse_str((string) wp_unslash($_POST['post_data']), $post_data);
+            $methods = isset($post_data['shipping_method']) ? (array) $post_data['shipping_method'] : [];
+        }
+
+        if (!$methods && function_exists('WC') && WC()->session) {
+            $methods = (array) WC()->session->get('chosen_shipping_methods', []);
+        }
 
         foreach ($methods as $method) {
             if (self::is_yandex_shipping_method(sanitize_text_field($method))) {

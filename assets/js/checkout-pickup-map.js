@@ -3,12 +3,15 @@
 
 	const state = {
 		points: [],
+		basePoints: [],
 		selectedPoint: null,
 		map: null,
 		clusterer: null,
 		mapPromise: null,
 		modalBound: false,
 		isLoading: false,
+		searchTimer: null,
+		searchSequence: 0,
 	};
 
 	const selectors = {
@@ -126,7 +129,23 @@
 		});
 
 		modal.querySelector('.nitisveta-yandex-pickup__search').addEventListener('input', function () {
-			renderList(this.value.trim());
+			const query = this.value.trim();
+			clearTimeout(state.searchTimer);
+			state.searchSequence++;
+
+			if (query.length < 3) {
+				if (!query && state.basePoints.length) {
+					state.points = state.basePoints;
+					renderMap();
+				}
+				renderList(query);
+				return;
+			}
+
+			const sequence = state.searchSequence;
+			state.searchTimer = setTimeout(function () {
+				searchPoints(query, sequence);
+			}, 500);
 		});
 
 		document.addEventListener('keydown', function (event) {
@@ -187,34 +206,17 @@
 
 		if (!city || city === 'город') {
 			state.points = [];
+			state.basePoints = [];
+			state.isLoading = false;
 			setStatus('Сначала выберите город');
 			renderList('');
 			renderMap();
 			return;
 		}
 
-		const url = new URL(config.restUrl, window.location.origin);
-		url.searchParams.set('city', city);
-		url.searchParams.set('country', country);
-
 		try {
-			const response = await fetch(url.toString(), {
-				headers: {
-					'X-WP-Nonce': config.restNonce || '',
-				},
-			});
-
-			const responseText = await response.text();
-			if (!response.ok) throw new Error(`HTTP ${response.status}: ${responseText.slice(0, 500)}`);
-
-			let payload;
-			try {
-				payload = JSON.parse(responseText);
-			} catch (parseError) {
-				throw new Error(`Invalid JSON from pickup points endpoint: ${responseText.slice(0, 500)}`);
-			}
-
-			state.points = Array.isArray(payload.points) ? payload.points : [];
+			state.points = await requestPoints(city, country);
+			state.basePoints = state.points;
 
 			if (!state.points.length) {
 				setStatus(config.labels.empty);
@@ -233,6 +235,49 @@
 			renderList('');
 		} finally {
 			state.isLoading = false;
+		}
+	}
+
+	async function searchPoints(query, sequence) {
+		const city = getCheckoutCity();
+		const country = document.querySelector(selectors.country)?.value || 'RU';
+		setStatus(config.labels.loading);
+
+		try {
+			const points = await requestPoints(city, country, query);
+			if (sequence !== state.searchSequence) return;
+
+			state.points = points;
+			setStatus(points.length ? '' : config.labels.empty);
+			renderList('');
+			await renderMap();
+		} catch (error) {
+			if (sequence !== state.searchSequence) return;
+			console.error(error);
+			setStatus(config.labels.error);
+		}
+	}
+
+	async function requestPoints(city, country, query = '') {
+		const url = new URL(config.restUrl, window.location.origin);
+		url.searchParams.set('city', city);
+		url.searchParams.set('country', country);
+		if (query) url.searchParams.set('query', query);
+
+		const response = await fetch(url.toString(), {
+			headers: {
+				'X-WP-Nonce': config.restNonce || '',
+			},
+		});
+
+		const responseText = await response.text();
+		if (!response.ok) throw new Error(`HTTP ${response.status}: ${responseText.slice(0, 500)}`);
+
+		try {
+			const payload = JSON.parse(responseText);
+			return Array.isArray(payload.points) ? payload.points : [];
+		} catch (parseError) {
+			throw new Error(`Invalid JSON from pickup points endpoint: ${responseText.slice(0, 500)}`);
 		}
 	}
 
@@ -535,7 +580,10 @@
 		$(document.body).on('updated_checkout', toggleContainer);
 		$(document).on('change', `${selectors.shipping} ${selectors.methodInput}`, toggleContainer);
 		$(document).on('change change.select2 select2:select', `${selectors.city}, ${selectors.country}`, function () {
+			clearTimeout(state.searchTimer);
+			state.searchSequence++;
 			state.points = [];
+			state.basePoints = [];
 			state.selectedPoint = null;
 			writeSelectedPoint(null);
 			storeSelectedPoint(null);
